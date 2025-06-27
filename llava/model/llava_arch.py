@@ -17,6 +17,7 @@ from abc import ABC, abstractmethod
 
 import torch
 import torch.nn as nn
+import logging
 
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_projector.builder import build_vision_projector
@@ -137,14 +138,92 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
-    def encode_images(self, images):
+    def encode_images(self, images, vision_index=None, use_avg_pool=None):
+        # images.shape: torch.Size([32, 3, 336, 336])
+        # type(vision_index): <class 'list'>,      type(use_avg_pool)  # <class 'list'>
         image_features = self.get_model().get_vision_tower()(images)
+        # <class 'torch.Tensor'>,       torch.Size([8, 576, 1024])  # 8 is the batch size
+        # if vision_index is a list of list
+        if isinstance(vision_index[0], list):
+            selected_image_features = []
+            for i, idxs in enumerate(vision_index):
+                # idxs.type:  <class 'list'>, idxs.len:  64
+                # idxs:  idxs:  [435, 247, 425, 214, 298, 369, 249, 432, 546, 420, 574, 254, 382, 483, 405, 50, 427, 264, 252, 127, 502, 536, 380, 195, 96, 492, 575, 62, 437, 522, 43, 423, 508, 28, 16, 440, 455, 453, 320, 518, 478, 80, 476, 319, 399, 253, 499, 304, 307, 535, 42, 74, 449, 64, 471, 567, 175, 187, 181, 49, 441, 213, 350, 527]
+                image_features_ = image_features[i]  # Shape: [576, 1024]
+                image_features_ = image_features_[idxs, :]  # Index into the first dimension -> Shape: [64, 1024]
+                selected_image_features.append(image_features_)
+            try:            
+                image_features = torch.stack(selected_image_features, dim=0)  # -> torch.Size([8, 64, 1024])
+            except:
+                try:
+                    max_len = max([feat.size(0) for feat in selected_image_features])
+                    padded_features = [torch.nn.functional.pad(feat, (0, 0, 0, max_len - feat.size(0))) for feat in selected_image_features]
+                    image_features = torch.stack(padded_features, dim=0)
+                except RuntimeError as e:
+                    print("Error in stacking features:", e)
+                    for i, feat in enumerate(selected_image_features):
+                        print(f"Feature {i} shape: {feat.shape}")
+
+        elif isinstance(vision_index, list) and all([x is None for x in vision_index]) is False:
+            print("Inside llava_arch.py: vision indexes are list and not all None")
+            selected_image_features = []
+            for i, idx in enumerate(vision_index):
+                if idx is not None:
+                    image_features_ = image_features[i]
+                    image_features_ = image_features_[idx, :]
+                    selected_image_features.append(image_features_)
+            image_features = torch.stack(selected_image_features, dim=0)
+        else:
+            if vision_index is not None:
+                # # For some images, it is coming here -> case: vision_index is a list of None (Need to check why)
+                # image_features.shape: -> torch.Size([8, 576, 1024]
+                # vision_index.type:  <class 'list'>, vision_index.len:  8 (batch size)
+                # vision_index[0].type:  <class 'NoneType'>,     vision_index:  [None, None, None, None, None, None, None, None]
+
+                if all([x is not None for x in vision_index]):  # (vision_index is a list of None)
+                    print("Inside llava_arch.py: all elements in vision_index are not None")
+                    image_features = image_features[:, vision_index, :]
+
+        # if use_avg_pool is a list and all items are None
+        if isinstance(use_avg_pool, list) and all([x is None for x in use_avg_pool]) is False:
+        # all_none = all([x is None for x in use_avg_pool])
+        # if isinstance(use_avg_pool, list) and all_none is False:
+            selected_image_features = []
+            for i, avg_pool in enumerate(use_avg_pool):
+                if avg_pool is not None:
+                    print("Inside llava_arch.py: using avg pool list")
+                    selected_image_features.append(torch.nn.functional.adaptive_avg_pool2d(image_features[i].permute(1, 0).unsqueeze(0), avg_pool).squeeze(0).permute(1, 0))
+                else:
+                    selected_image_features.append(image_features[i])
+            image_features = torch.stack(selected_image_features, dim=0)
+        elif use_avg_pool is not None and type(use_avg_pool) is tuple: 
+            print("Inside llava_arch.py: using avg pool")
+            image_features = image_features.reshape(-1, 24, 24, 1024)
+
+            max_dim = use_avg_pool[0] * use_avg_pool[1]
+            image_features = torch.nn.functional.adaptive_avg_pool2d(image_features.permute(0, 3, 1, 2), use_avg_pool).permute(0, 2, 3, 1).reshape(-1, max_dim, 1024)
+        
+        # Before Projecting images to model:    
+        # - For vision_index: image_features.shape -> torch.Size([8, 64, 1024])
+        # - For use_avg_pool: !!! (Not sure yet)
+        # - When vision_index is a list of None (indicating image was not present in batch (a dump image)), 
+        #   for these images, we don't have sampling indexes. 
+        #   So, Image features shape before projecting:  torch.Size([8, 576, 1024])
+        
         image_features = self.get_model().mm_projector(image_features)
+
+        # After projecting images: 
+        # - For vision_index: image_features.shape -> torch.Size([8, 64, 4096])
+        # - For use_avg_pool: image_features.shape -> !!! (Not sure yet)
+        # - When vision_index is a list of None (indicating image was not present in batch (a dump image)),
+        #   for these images, we don't have sampling indexes.
+        #   So, Image features shape after projecting:  torch.Size([8, 576, 4096])
+        
         return image_features
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
-        images, image_sizes=None
+        images, image_sizes=None, vision_index=None, use_avg_pool=None
     ):
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
@@ -154,7 +233,11 @@ class LlavaMetaForCausalLM(ABC):
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
-            image_features = self.encode_images(concat_images)
+            # logging.info(f"Image shape before encoding: {concat_images.shape}")
+            # print(f"Image shape before encoding: {concat_images.shape}")
+            image_features = self.encode_images(concat_images, vision_index, use_avg_pool)
+            # logging.info(f"Image features shape after encoding: {image_features.shape}")
+            # print(f"Image features shape after encoding: {image_features.shape}")
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
@@ -199,7 +282,11 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images)
+            # logging.info(f"Image shape before encoding-2: {images.shape}")
+            # print(f"Image shape before encoding-2: {images.shape}")
+            image_features = self.encode_images(images, vision_index, use_avg_pool)
+            # logging.info(f"Image features shape after encoding-2: {image_features.shape}")
+            # print(f"Image features shape after encoding-2: {image_features.shape}")
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):

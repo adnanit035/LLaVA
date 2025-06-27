@@ -1,7 +1,8 @@
 import os
 import torch
 import torch.nn as nn
-
+from typing import Dict, Union, Any
+import inspect
 from torch.utils.data import Sampler
 
 from transformers import Trainer
@@ -131,11 +132,110 @@ class LengthGroupedSampler(Sampler):
 
 
 class LLaVATrainer(Trainer):
+    def __init__(self, *args, compute_loss_func=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.compute_loss_func = compute_loss_func  # Initialize compute_loss_func
+        
+        signature = inspect.signature(self.model.forward)
+        self.model_accepts_loss_kwargs = any(
+            p.kind == p.VAR_KEYWORD for p in signature.parameters.values()
+        )
+
+        # # Check if the model's forward method accepts loss_kwargs
+        # # Just in case the model was wrapped outside of the `Trainer`
+        # unwrapped_model = self.accelerator.unwrap_model(self.model)
+        # model_forward = (
+        #     unwrapped_model.forward
+        #     if not _is_peft_model(unwrapped_model)
+        #     else unwrapped_model.get_base_model().forward
+        # )
+
+        # forward_params = inspect.signature(self.model_forward).parameters
+        # self.model_accepts_loss_kwargs = (
+        #     "loss_kwargs" in forward_params and forward_params["loss_kwargs"].kind == inspect.Parameter.VAR_KEYWORD
+        # )
+
+
+        # signature = inspect.signature(self.model.forward)
+        # self.model_accepts_loss_kwargs = any(
+        #     p.kind == p.VAR_KEYWORD for p in signature.parameters.values()
+        # )
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+        Custom loss computation for handling additional inputs: `vision_index` and `use_avg_pool`.
+
+        Args:
+            model (`nn.Module`): The model to train.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`): The inputs and targets of the model.
+            return_outputs (`bool`, optional): Whether to return the model's outputs along with the loss.
+            num_items_in_batch (`int`, optional): Number of items in the batch (for scaling purposes).
+
+        Returns:
+            `torch.Tensor` or `(torch.Tensor, dict)`: The loss tensor or a tuple of the loss tensor and outputs.
+        """
+        # Extract labels if present
+        if (self.label_smoother is not None or self.compute_loss_func is not None) and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+
+        # Add any additional kwargs (e.g., num_items_in_batch) if supported by the model
+        if self.model_accepts_loss_kwargs:
+            loss_kwargs = {}
+            if num_items_in_batch is not None:
+                loss_kwargs["num_items_in_batch"] = num_items_in_batch
+            inputs = {**inputs, **loss_kwargs}
+
+        # Extract custom inputs like vision_index and use_avg_pool
+        vision_index = inputs.pop("vision_index", None)
+        use_avg_pool = inputs.pop("use_avg_pool", None)
+        
+        # Forward pass with custom inputs
+        outputs = model(**inputs, vision_index=vision_index, use_avg_pool=use_avg_pool)
+
+        # Save past state if it exists
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        # Loss computation
+        if labels is not None:
+            unwrapped_model = self.accelerator.unwrap_model(model)
+            breakpoint()
+            if _is_peft_model(unwrapped_model):
+                model_name = unwrapped_model.base_model.model._get_name()
+            else:
+                model_name = unwrapped_model._get_name()
+
+            # Custom loss function if provided
+            if self.compute_loss_func is not None:
+                loss = self.compute_loss_func(outputs, labels, num_items_in_batch=num_items_in_batch)
+            elif model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+                loss = self.label_smoother(outputs, labels, shift_labels=True)
+            else:
+                loss = self.label_smoother(outputs, labels)
+        else:
+            # Use default loss computation
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        # Optional scaling for multi-process setups
+        if hasattr(self.args, "average_tokens_across_devices") and self.args.average_tokens_across_devices:
+            loss *= self.accelerator.num_processes
+
+        # if self.args.average_tokens_across_devices and self.model_accepts_loss_kwargs:
+        #     loss *= self.accelerator.num_processes
+
+        return (loss, outputs) if return_outputs else loss
 
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None
-
+        
         if self.args.group_by_modality_length:
             lengths = self.train_dataset.modality_lengths
             return LengthGroupedSampler(

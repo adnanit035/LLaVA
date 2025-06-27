@@ -182,7 +182,7 @@ def process_images(images, image_processor, model_cfg):
     return new_images
 
 
-def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):
+def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None, vision_index=None, image_features=None, use_avg_pool=None):
     prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split('<image>')]
 
     def insert_separator(X, sep):
@@ -194,6 +194,16 @@ def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX
         offset = 1
         input_ids.append(prompt_chunks[0][0])
 
+    # if vision_index is not None:
+    #     # print("Inside llava_arch.py: using vision indexes")
+    #     image_features = image_features[:, vision_index, :]
+    # elif use_avg_pool is not None:
+    #     # print("Inside llava_arch.py: using avg pool")
+    #     image_features = image_features.reshape(-1, 24, 24, 1024)
+
+    #     max_dim = use_avg_pool[0] * use_avg_pool[1]
+    #     image_features = torch.nn.functional.adaptive_avg_pool2d(image_features.permute(0, 3, 1, 2), use_avg_pool).permute(0, 2, 3, 1).reshape(-1, max_dim, 1024)
+
     for x in insert_separator(prompt_chunks, [image_token_index] * (offset + 1)):
         input_ids.extend(x[offset:])
 
@@ -201,6 +211,7 @@ def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX
         if return_tensors == 'pt':
             return torch.tensor(input_ids, dtype=torch.long)
         raise ValueError(f'Unsupported tensor type: {return_tensors}')
+    
     return input_ids
 
 

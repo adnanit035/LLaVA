@@ -14,12 +14,16 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import math
 import os
 import copy
+import json, re, ast
+from pathlib import Path   # just for nicer paths
 from dataclasses import dataclass, field
 import json
 import logging
 import pathlib
+from collections import defaultdict
 from typing import Dict, Optional, Sequence, List
 
 import torch
@@ -37,6 +41,7 @@ from llava.mm_utils import tokenizer_image_token
 
 from PIL import Image
 
+# logger = logging.getLogger(__name__)
 
 local_rank = None
 
@@ -48,6 +53,50 @@ def rank0_print(*args):
 
 from packaging import version
 IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse('0.14')
+
+
+def load_possibly_dirty_json(json_file):
+    """
+    Try reading a JSON file that might contain single quotes or
+    a trailing comma like `], }`.
+    Returns the parsed object or raises the original JSONDecodeError.
+    """
+    try:
+        # load jsonl file
+        if json_file.endswith('.jsonl'):
+            with open(json_file, 'r', encoding='utf-8') as f:
+                return [json.loads(line) for line in f]
+    except:    
+        json_file = Path(json_file)
+        raw = json_file.read_text(encoding="utf‑8")
+
+        # --- 1. vanilla ----------------------------------------------------------
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as err:
+            # eval_logger.warning(f"Standard JSON load failed: {err}")
+            print(f"Standard JSON load failed: {err}")
+
+        # --- 2. fix single quotes + trailing commas ------------------------------
+        cleaned = raw
+        # (a) replace unescaped single quotes with double quotes
+        cleaned = re.sub(r"(?<!\\)'", '"', cleaned)
+        # (b) drop any comma immediately before } or ]
+        cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as err:
+            # eval_logger.warning(f"Second JSON load failed: {err}")
+            print(f"Second JSON load failed: {err}")
+
+        # --- 3. last‑ditch: Python literal eval ----------------------------------
+        try:
+            return ast.literal_eval(raw)
+        except Exception as err:
+            # eval_logger.error(f"ast.literal_eval failed: {err}")
+            print(f"ast.literal_eval failed: {err}")
+            raise  # propagate the original problem
 
 
 @dataclass
@@ -64,12 +113,15 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
+    num_visual_tokens: Optional[int] = field(default=None, metadata={"help": "Number of visual tokens for token compression."})
+    avg_pool_size: Optional[int] = field(default=None, metadata={"help": "Average pooling size for token compression."})
 
 
 @dataclass
 class DataArguments:
-    data_path: str = field(default=None,
-                           metadata={"help": "Path to the training data."})
+    data_path: str = field(default=None, metadata={"help": "Path to the training data."})
+    sampling_method: Optional[str] = field(default=None, metadata={"help": "Sampling method e.g. ['fps', 'topk', 'bottomk', 'random-0', 'random-1', 'random-2', 'random-3', 'random-4']."})
+    indexes_json_path: Optional[str] = field(default=None, metadata={"help": "Path to the sampling indexes json file."})
     lazy_preprocess: bool = False
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
@@ -108,8 +160,10 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_dropout: float = 0.05
     lora_weight_path: str = ""
     lora_bias: str = "none"
-    mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
+    dataloader_drop_last: bool = field(default=True)
+    mm_projector_lr: Optional[float] = None
+    training_task: Optional[str] = field(default=None, metadata={"help": "Training task either `pretraining` or `finetuning`."})
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -588,6 +642,8 @@ def preprocess_mpt(
 def preprocess_plain(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
+    vision_index: Optional[List[int]] = None,
+    use_avg_pool: Optional[int] = None
 ) -> Dict:
     # add end signal and concatenate together
     conversations = []
@@ -597,6 +653,7 @@ def preprocess_plain(
         source[0]['value'] = DEFAULT_IMAGE_TOKEN
         conversation = source[0]['value'] + source[1]['value'] + conversation_lib.default_conversation.sep
         conversations.append(conversation)
+
     # tokenize conversations
     input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
     targets = copy.deepcopy(input_ids)
@@ -610,7 +667,9 @@ def preprocess_plain(
 def preprocess(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
+    has_image: bool = False,
+    vision_index: Optional[List[int]] = None,
+    use_avg_pool: Optional[int] = None
 ) -> Dict:
     """
     Given a list of sources, each is a conversation list. This transform:
@@ -619,20 +678,25 @@ def preprocess(
     3. Tokenize the concatenated conversation;
     4. Make a deepcopy as the target. Mask human words with IGNORE_INDEX.
     """
+    # print("conversation_lib.default_conversation.sep_style:", conversation_lib.default_conversation.sep_style)
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
-        return preprocess_plain(sources, tokenizer)
+        return preprocess_plain(sources, tokenizer, vision_index=vision_index, use_avg_pool=use_avg_pool)
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
         return preprocess_llama_2(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version.startswith("v1"):
         return preprocess_v1(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "mpt":
         return preprocess_mpt(sources, tokenizer, has_image=has_image)
+    
+    # print("After if in preprocess...")
+
     # add end signal and concatenate together
     conversations = []
     for source in sources:
         header = f"{conversation_lib.default_conversation.system}\n\n"
         conversation = _add_speaker_and_signal(header, source)
         conversations.append(conversation)
+
     # tokenize conversations
     def get_tokenize_len(prompts):
         return [len(tokenizer_image_token(prompt, tokenizer)) for prompt in prompts]
@@ -658,16 +722,90 @@ def preprocess(
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, data_path: str,
-                 tokenizer: transformers.PreTrainedTokenizer,
-                 data_args: DataArguments):
+    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments, training_task: Optional[str] = None, num_visual_tokens: Optional[int] = None, avg_pool_size: Optional[int] = None):
         super(LazySupervisedDataset, self).__init__()
-        list_data_dict = json.load(open(data_path, "r"))
+
+        self.list_indexes_dict = None
+        self.list_data_dict = None
+        self.training_task = training_task
+
+        # if data_args.sampling_method is not None and training_task == "finetuning":
+        #     self.sampling_method = data_args.sampling_method
+        #     # load jsons from the indexes_json_path containing sampling_method word in the filename e.g. FPS
+        #     list_of_files = os.listdir(data_args.indexes_json_path)
+        #     print("list_of_files:", list_of_files)
+        #     selected_jsons_list = [filename for filename in list_of_files if data_args.sampling_method in filename]
+        #     print("selected_jsons_list:", selected_jsons_list)  # if sampling method was FPS, then it will contains all jsons with FPS
+        #     # load all jsons and merge them into one
+        #     self.list_indexes_dict = {}
+        #     for filename in selected_jsons_list:
+        #         with open(os.path.join(data_args.indexes_json_path, filename), "r") as f:
+        #             data = f.read()
+        #         try:
+        #             data = json.loads(data)
+        #         except:
+        #             data = data.replace('], }', ']}')
+        #             data = json.loads(data)
+
+        #         self.list_indexes_dict = {**self.list_indexes_dict, **data}
+        # else:
+        #     if data_args.indexes_json_path is not None:
+        #         with open(data_args.indexes_json_path, "r") as f:
+        #                 data = f.read()
+        #         try:
+        #             self.list_indexes_dict = json.loads(data)
+        #             print("Loaded indexes json...")
+        #         except:
+        #             data = data.replace('], }', ']}')
+        #             self.list_indexes_dict = json.loads(data)
+        #             print("Loaded indexes json...")
+        
+        if data_args.indexes_json_path is not None:
+            # with open(data_args.indexes_json_path, "r") as f:
+            #         data = f.read()
+            # try:
+            #     self.list_indexes_dict = json.loads(data)
+            #     print("Loaded indexes json...")
+            # except:
+            #     data = data.replace('], }', ']}')
+            #     self.list_indexes_dict = json.loads(data)
+            #     print("Loaded indexes json...")
+            data = load_possibly_dirty_json(data_args.indexes_json_path)
+            if isinstance(data, dict):
+                self.list_indexes_dict = data
+                print("Loaded indexes json...")
+            elif isinstance(data, list):
+                # If the data is a list, we assume it is a list of dictionaries with 'id' as key
+                self.list_indexes_dict = {item['id']: item for item in data if 'id' in item}
+                print("Loaded indexes json as a list of dictionaries...")
+        else:
+            self.list_indexes_dict = None
+            print("No indexes json provided, will not use visual tokens.")
+
+        # Adding avarage pooling size or limiting visual tokens to the model
+        if avg_pool_size is not None:
+            self.avg_pool_size = [int(math.sqrt(avg_pool_size)), int(math.sqrt(avg_pool_size))]  # [avg_pool_size, avg_pool_size]
+            print(f"Using average pooling size: {self.avg_pool_size}")
+        
+        # list_data_dict = json.load(open(data_path, "r"))
+        raw_data = json.load(open(data_path, "r"))
+        print(f"Loaded dataset: {len(raw_data)} entries.")
+        list_data_dict = [sample for sample in raw_data if 'image' in sample]
+        print(f"Filtered dataset: {len(list_data_dict)} entries with images.")
+
+        # image_files = [
+        #     str(file) for file in pathlib.Path(self.data_args.image_folder).rglob("*")
+        #     if file.suffix.lower() in ['.jpg', '.jpeg', '.png']
+        # ]
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.list_data_dict = list_data_dict
         self.data_args = data_args
+        self.num_visual_tokens = num_visual_tokens
+        
+        image_files = None
+        self.image_files = image_files
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -675,18 +813,23 @@ class LazySupervisedDataset(Dataset):
     @property
     def lengths(self):
         length_list = []
-        for sample in self.list_data_dict:
-            img_tokens = 128 if 'image' in sample else 0
-            length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
+        
+        if self.list_data_dict:
+            for sample in self.list_data_dict:
+                img_tokens = 128 if 'image' in sample else 0
+                length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
+
         return length_list
 
     @property
     def modality_lengths(self):
         length_list = []
-        for sample in self.list_data_dict:
-            cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
-            cur_len = cur_len if 'image' in sample else -cur_len
-            length_list.append(cur_len)
+        if self.list_data_dict:
+            for sample in self.list_data_dict:
+                cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
+                cur_len = cur_len if 'image' in sample else -cur_len
+                length_list.append(cur_len)
+
         return length_list
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
@@ -694,11 +837,21 @@ class LazySupervisedDataset(Dataset):
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+        
         if 'image' in sources[0]:
             image_file = self.list_data_dict[i]['image']
+            if self.training_task is not None and self.training_task == "finetuning":
+                # image_id = image_file.split(".")[0]  # for older version of indexes json
+                image_id = image_file
+            else:
+                image_id = self.list_data_dict[i]['id']
+
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
-            image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+
+            image_path = os.path.join(image_folder, image_file)
+            image = Image.open(image_path).convert("RGB")
+
             if self.data_args.image_aspect_ratio == 'pad':
                 def expand2square(pil_img, background_color):
                     width, height = pil_img.size
@@ -716,26 +869,45 @@ class LazySupervisedDataset(Dataset):
                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
             else:
                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
-            sources = preprocess_multimodal(
-                copy.deepcopy([e["conversations"] for e in sources]),
-                self.data_args)
-        else:
-            sources = copy.deepcopy([e["conversations"] for e in sources])
-        data_dict = preprocess(
-            sources,
-            self.tokenizer,
-            has_image=('image' in self.list_data_dict[i]))
+
+            sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
+
+            # get the visual index for the image
+            visual_index = None
+            if self.list_indexes_dict:
+                visual_index = self.list_indexes_dict[image_id][: self.num_visual_tokens]
+        # else:
+        #     sources = copy.deepcopy([e["conversations"] for e in sources])
+        #     # print("No image in the data for index (as per dataloader):", i)
+        #     visual_index = None
+            
+        data_dict = preprocess(sources, self.tokenizer, has_image=('image' in self.list_data_dict[i]), vision_index=visual_index)
         if isinstance(i, int):
-            data_dict = dict(input_ids=data_dict["input_ids"][0],
-                             labels=data_dict["labels"][0])
+            data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
 
         # image exist in the data
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
-        elif self.data_args.is_multimodal:
-            # image does not exist in the data, but the model is multimodal
-            crop_size = self.data_args.image_processor.crop_size
-            data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+        # elif self.data_args.is_multimodal:
+        #     print("No image in the data, for index (index as per dataloader):", i)
+        #     # image does not exist in the data, but the model is multimodal
+        #     crop_size = self.data_args.image_processor.crop_size
+        #     data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width']) # dummy image
+        
+        if getattr(self, "avg_pool_size", None):
+            data_dict['vision_index'] = None
+            data_dict['use_avg_pool'] = self.avg_pool_size
+        else:
+            if visual_index is not None:
+                data_dict['vision_index'] = visual_index
+            else:
+                data_dict['vision_index'] = None
+
+            data_dict['use_avg_pool'] = None
+
+        # print("data_dict:", data_dict)
+        # print("Visual index:", data_dict['vision_index'], "Use avg pool:", data_dict['use_avg_pool'])
+
         return data_dict
 
 
@@ -745,57 +917,80 @@ class DataCollatorForSupervisedDataset(object):
 
     tokenizer: transformers.PreTrainedTokenizer
 
-    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple([instance[key] for instance in instances]
-                                  for key in ("input_ids", "labels"))
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids,
-            batch_first=True,
-            padding_value=self.tokenizer.pad_token_id)
-        labels = torch.nn.utils.rnn.pad_sequence(labels,
-                                                 batch_first=True,
-                                                 padding_value=IGNORE_INDEX)
+    # def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+    def __call__(self, instances: Sequence[Optional[Dict]]) -> Dict[str, torch.Tensor]:
+         # Filter out None instances
+        instances = [instance for instance in instances if instance is not None]
+        # print("instances:", instances)
+
+        if not instances:
+            return None  # Return None if no valid instances are found in this batch
+            
+        input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
+        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
         input_ids = input_ids[:, :self.tokenizer.model_max_length]
         labels = labels[:, :self.tokenizer.model_max_length]
-        batch = dict(
-            input_ids=input_ids,
-            labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
-        )
-
+        # print("input_ids.shape:", input_ids.shape)  # torch.Size([8, 535]), torch.Size([8, 634]), torch.Size([8, 541]), torch.Size([8, 606]) ... 8 is the batch size
+        # print("labels.shape:", labels.shape)  # torch.Size([8, 535]), torch.Size([8, 634]), torch.Size([8, 541]), torch.Size([8, 606]) ... 8 is the batch size
+        batch = dict(input_ids=input_ids, labels=labels, attention_mask=input_ids.ne(self.tokenizer.pad_token_id),)
+        
         if 'image' in instances[0]:
             images = [instance['image'] for instance in instances]
-            if all(x is not None and x.shape == images[0].shape for x in images):
-                batch['images'] = torch.stack(images)
+            # type(images): <class 'list'>,    len(images)): 8 (batch size)
+            # images[0].shape  # torch.Size([3, 336, 336]),   images[-2].shape) # torch.Size([3, 336, 336])
+            if all(x is not None and x.shape == images[0].shape for x in images):  # it came here (All images are of same shape)
+                batch['images'] = torch.stack(images)  # -> torch.Size([8, 3, 336, 336])
             else:
                 batch['images'] = images
 
+        if 'vision_index' in instances[0]:
+            vision_index = [instance['vision_index'] for instance in instances]
+
+            # type(vision_index): <class 'list'>,    len(vision_index)): 8
+            # vision_index is a list of list (batch_size x num_visual_tokens [8 x 64. 8 lists and each list contains 64 elements])
+            # type(vision_index[0]): <class 'list'>,   len(vision_index[0])): 64
+            # vision_index[0]: [77, 45, 422, 569, 463, 382, 132, 184, 13, 336, 452, 361, 228, 444, 501, 78, 61, 93, 126, 335, 369, 352, 450, 1, 493, 464, 521, 9, 375, 182, 320, 123, 157, 82, 478, 90, 479, 517, 504, 220, 499, 47, 158, 142, 567, 291, 364, 470, 265, 168, 215, 525, 2, 403, 512, 25, 96, 420, 431, 148, 491, 286, 102, 353]
+            
+            # if all(x is not None and x.shape == vision_index[0].shape for x in vision_index):
+            #     batch['vision_index'] = torch.stack(vision_index)
+            
+            # TODO: batch['images'] = torch.stack(images)  # -> torch.Size([8, 3, 336, 336]) is a tensor of images (batch_size x 3 x 336 x 336) => 8 x 3 x 336 x 336 but vision_index is a list of lists (batch_size x num_visual_tokens) => 8 x 64
+            # Is it okay? or should I convert vision_index to tensor?????
+            
+            # TODO: What about those images which are dummy and have no visual tokens (i.e. vision_index is None)?
+            batch['vision_index'] = vision_index  # -> list of lists (batch_size x num_visual_tokens) => 8 x 64
+        
+        if 'use_avg_pool' in instances[0]:
+            use_avg_pool = [instance['use_avg_pool'] for instance in instances]
+            # if all(x is not None and x.shape == use_avg_pool[0].shape for x in use_avg_pool):
+            #     batch['use_avg_pool'] = torch.stack(use_avg_pool)
+
+            batch['use_avg_pool'] = use_avg_pool
+
+        # save batch to log file for debugging (to see what is in the batch when loss suddenly becomes 0.0)
+        # logging.info(f"Batch: {batch}")
         return batch
 
 
-def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
-                                data_args) -> Dict:
+def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args, training_task=None, num_visual_tokens=None, avg_pool_size=None) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
-                                data_path=data_args.data_path,
-                                data_args=data_args)
+    train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args, training_task=training_task, num_visual_tokens=num_visual_tokens, avg_pool_size=avg_pool_size)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset,
-                eval_dataset=None,
-                data_collator=data_collator)
+    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
 
 def train(attn_implementation=None):
     global local_rank
 
-    parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments))
+    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
+        print("Using BitsAndBytesConfig...")
         from transformers import BitsAndBytesConfig
         bnb_model_from_pretrained_args.update(dict(
             device_map={"": training_args.device},
@@ -817,6 +1012,7 @@ def train(attn_implementation=None):
         if 'mpt' in model_args.model_name_or_path:
             config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
             config.attn_config['attn_impl'] = training_args.mpt_attn_impl
+            # CHECKPOINT # /llava/model/language_model/llava_mpt.py
             model = LlavaMptForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 config=config,
@@ -824,11 +1020,18 @@ def train(attn_implementation=None):
                 **bnb_model_from_pretrained_args
             )
         else:
+            print("Using LlamaForCausalLM...")
+            print("model_args.model_name_or_path:", model_args.model_name_or_path)
+            print("training_args.cache_dir:", training_args.cache_dir)
+            print("num_visual_tokens:", model_args.num_visual_tokens)
+            print("bnb_model_from_pretrained_args:", bnb_model_from_pretrained_args)
+            # CHECKPOINT # /llava/model/language_model/llava_llama.py
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
                 attn_implementation=attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+                # num_visual_tokens=model_args.num_visual_tokens,
                 **bnb_model_from_pretrained_args
             )
     else:
@@ -908,6 +1111,7 @@ def train(attn_implementation=None):
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
     if model_args.vision_tower is not None:
+        print("Initializing vision modules...")
         model.get_model().initialize_vision_modules(
             model_args=model_args,
             fsdp=training_args.fsdp
@@ -956,12 +1160,15 @@ def train(attn_implementation=None):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
-    data_module = make_supervised_data_module(tokenizer=tokenizer,
-                                              data_args=data_args)
-    trainer = LLaVATrainer(model=model,
-                    tokenizer=tokenizer,
-                    args=training_args,
-                    **data_module)
+    # print("Model Args:", model_args)
+    # print()
+    # print("Data Args:", data_args)
+    # print()
+    # print("Training Args:", training_args)
+    # print()
+
+    data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args, training_task=training_args.training_task, num_visual_tokens=model_args.num_visual_tokens, avg_pool_size=model_args.avg_pool_size)
+    trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

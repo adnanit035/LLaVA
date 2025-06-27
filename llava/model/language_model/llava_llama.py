@@ -68,6 +68,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
+        # cache_position=None,
+        # num_visual_tokens=None,
+        vision_index=None,
+        use_avg_pool=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if inputs_embeds is None:
@@ -85,7 +89,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 past_key_values,
                 labels,
                 images,
-                image_sizes
+                image_sizes,
+                vision_index,
+                use_avg_pool
             )
 
         return super().forward(
@@ -98,7 +104,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict
+            return_dict=return_dict,
+            # cache_position=cache_position
         )
 
     @torch.no_grad()
@@ -129,7 +136,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 None,
                 None,
                 images,
-                image_sizes=image_sizes
+                image_sizes=image_sizes,
+                # num_visual_tokens=kwargs.get("num_visual_tokens", None),
+                vision_index=kwargs.get("vision_index", None),
+                use_avg_pool=kwargs.get("use_avg_pool", None),
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
@@ -141,8 +151,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             **kwargs
         )
 
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None,
-                                      inputs_embeds=None, **kwargs):
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
         images = kwargs.pop("images", None)
         image_sizes = kwargs.pop("image_sizes", None)
         inputs = super().prepare_inputs_for_generation(
@@ -152,6 +161,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             inputs['images'] = images
         if image_sizes is not None:
             inputs['image_sizes'] = image_sizes
+        
+        inputs["vision_index"] = kwargs.get("vision_index", None)
+        inputs["use_avg_pool"] = kwargs.get("use_avg_pool", None)
+        
         return inputs
 
 AutoConfig.register("llava_llama", LlavaConfig)
